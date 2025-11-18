@@ -1,0 +1,16 @@
+\begin{table}[t]
+\centering
+\caption{Progressive accuracy improvements on SDNET2025.}
+\label{tab:progress}
+\begin{tabular}{llcc}
+\toprule
+Stage & Key Technique & Test Acc (\%) & $\Delta$ (pp) \\
+\midrule
+Zero-shot CLIP & ViT-B/32 + domain prompts & 51.70 & +0.00 \\
+Baseline Probe & Linear classifier, 100 shots & 51.70 & +0.00 \\
+Improved Probe & MLP + mixup + class weights & 63.30 & +11.60 \\
+Prompt + Backbone & Prompt engineering + ViT-L/14 & 67.55 & +4.25 \\
+Grid Search & Best LR/WD/dropout combo & 69.68 & +2.13 \\
+\bottomrule
+\end{tabular}
+\end{table}
