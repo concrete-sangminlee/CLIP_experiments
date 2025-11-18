@@ -48,56 +48,18 @@ Thumbs.db
 *.pt
 *.ckpt
 
-# Data files
+# Data files (large dataset)
 data/SDNET2025/
 
 # Extracted features (can be regenerated)
-*.npy
-
-# LaTeX auxiliary files
-paper/*.aux
-paper/*.log
-paper/*.out
-paper/*.toc
-paper/*.bbl
-paper/*.blg
-paper/*.synctex.gz
-paper/*.fdb_latexmk
-paper/*.fls
-paper/*.pdf
-
-# Temporary files
-*.tmp
-*.bak
-*~
-
-# Git backup
-.git_old/
-
-# Results and outputs
-results/
-outputs/
-grid_search_results.txt
-*.csv
-*.json
-
-# Word document temporary files
-~$*.docx
-~$*.doc
-*.tmp
-
-# Feature files (can be regenerated)
 clip_features.npy
 clip_labels.npy
 clip_class_names.npy
 clip_image_paths.npy
 
-# Jupyter Notebook outputs
-*.ipynb_checkpoints/
-*.ipynb
+# Temporary files
+*.tmp
+*.bak
 
-# Model outputs
-checkpoints/
-models/
-*.pkl
-*.h5
+# Git backup
+.git_old/
