@@ -74,6 +74,30 @@ paper/*.pdf
 # Git backup
 .git_old/
 
-# Results and outputs (optional - uncomment if you don't want to track)
-# results/
-# outputs/
+# Results and outputs
+results/
+outputs/
+grid_search_results.txt
+*.csv
+*.json
+
+# Word document temporary files
+~$*.docx
+~$*.doc
+*.tmp
+
+# Feature files (can be regenerated)
+clip_features.npy
+clip_labels.npy
+clip_class_names.npy
+clip_image_paths.npy
+
+# Jupyter Notebook outputs
+*.ipynb_checkpoints/
+*.ipynb
+
+# Model outputs
+checkpoints/
+models/
+*.pkl
+*.h5

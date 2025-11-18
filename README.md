@@ -155,16 +155,9 @@ python scripts/generate_publication_assets.py
   - `performance_progression.tex`: 단계별 성능 향상
   - `grid_search_top.tex`: 그리드 서치 상위 5개 결과
   - `class_performance.tex`: 클래스별 상세 성능 지표 (Precision, Recall, F1)
+  - `confusion_report.txt`: 분류 리포트 (텍스트 형식)
 
-### 로컬에서 LaTeX 컴파일
-
-```bash
-cd paper
-pdflatex main.tex
-bibtex main
-pdflatex main.tex
-pdflatex main.tex
-```
+**참고**: 생성된 LaTeX 표 파일들은 Word 문서에 직접 복사-붙여넣기하거나, 필요시 수정하여 사용할 수 있습니다.
 
 ## 🔧 주요 기술 및 실험 설정
 
@@ -211,6 +204,22 @@ pdflatex main.tex
 
 연구 및 교육 목적으로 사용 가능합니다.
 
+## 📋 파일 설명
+
+### 스크립트 파일
+- `extract_features.py`: CLIP 모델을 사용하여 이미지에서 feature 벡터 추출
+- `zero_shot_baseline.py`: Zero-shot CLIP 분류 성능 평가
+- `train_linear_probe.py`: MLP probe를 사용한 분류기 학습 및 평가
+- `generate_publication_assets.py`: 논문용 그림과 표 자동 생성
+
+### 생성되는 파일
+- `clip_features.npy`: 추출된 CLIP feature 벡터 (N×768)
+- `clip_labels.npy`: 클래스 레이블 (0, 1, 2)
+- `clip_class_names.npy`: 클래스 이름 배열
+- `clip_image_paths.npy`: 이미지 파일 경로 배열
+
+**주의**: `.npy` 파일들은 `.gitignore`에 포함되어 있어 Git에 추적되지 않습니다. 필요시 `extract_features.py`를 실행하여 재생성할 수 있습니다.
+
 ---
 
-**최종 업데이트**: 2025-11-18
+**최종 업데이트**: 2025-01-XX
