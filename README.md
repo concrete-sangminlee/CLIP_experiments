@@ -1,6 +1,6 @@
 # CLIP-based Bolt Classification Research
 
-Vision-Language Model (VLM) 기반 볼트 분류 연구 프로젝트입니다. CLIP 모델을 활용하여 SDNET2025 데이터셋의 볼트 이미지를 분류합니다.
+Vision-Language Model (VLM) 기반 볼트 결함 분류 연구 프로젝트입니다. CLIP 모델을 활용하여 SDNET2025 데이터셋의 볼트 이미지를 분류합니다.
 
 ## 📊 프로젝트 개요
 
@@ -31,12 +31,12 @@ CLIP zero-shot 베이스라인(51.70%)에서 시작하여 domain-aware prompt en
 ```
 research_VLM/
 ├── paper/                      # 논문 관련 파일
-│   ├── figures/               # 논문 그림 (PNG)
+│   ├── figures/               # 논문 그림 (PNG, 300 DPI)
 │   │   ├── confusion_matrix.png
 │   │   ├── grid_search_heatmap.png
 │   │   ├── performance_progression.png
 │   │   └── tsne_projection.png
-│   └── tables/                # 논문 테이블 (LaTeX)
+│   └── tables/                # 논문 테이블 (LaTeX 형식)
 │       ├── confusion_report.txt
 │       ├── dataset_overview.tex
 │       ├── grid_search_top.tex
@@ -45,15 +45,21 @@ research_VLM/
 │
 ├── scripts/                   # 실험 스크립트
 │   ├── extract_features.py           # CLIP feature 추출
-│   ├── train_linear_probe.py         # Linear Probe 학습 (최종 버전)
-│   ├── zero_shot_baseline.py         # Zero-shot 베이스라인
-│   └── generate_publication_assets.py # 논문 자료 생성
+│   ├── train_linear_probe.py         # MLP Probe 학습 및 평가
+│   ├── zero_shot_baseline.py         # Zero-shot CLIP 베이스라인
+│   └── generate_publication_assets.py # 논문 자료 자동 생성
 │
-├── data/                      # 데이터 (gitignore)
-│   └── SDNET2025/            # 데이터셋
+├── data/                      # 데이터셋 (Git에 추적되지 않음)
+│   └── SDNET2025/
+│       └── Dataset/
+│           ├── Defected/
+│           │   ├── Annotated Loosen bolt & nuts/
+│           │   └── Annotated Missing bolt & nuts/
+│           └── Fixed/
 │
-├── .gitignore
-└── README.md
+├── venv/                      # Python 가상환경 (Git에 추적되지 않음)
+├── .gitignore                 # Git 무시 파일 목록
+└── README.md                  # 프로젝트 문서
 ```
 
 ## 🚀 빠른 시작
@@ -74,7 +80,16 @@ pip install scikit-learn matplotlib seaborn pandas numpy
 
 ### 2. 데이터 준비
 
-SDNET2025 데이터셋을 `data/SDNET2025/` 폴더에 배치합니다.
+SDNET2025 데이터셋을 `data/SDNET2025/` 폴더에 배치합니다. 데이터 구조는 다음과 같아야 합니다:
+
+```
+data/SDNET2025/
+└── Dataset/
+    ├── Defected/
+    │   ├── Annotated Loosen bolt & nuts/Resized images 640-640/
+    │   └── Annotated Missing bolt & nuts/Resized- 640-640/
+    └── Fixed/640-640/
+```
 
 ### 3. 실험 실행
 
@@ -84,8 +99,15 @@ SDNET2025 데이터셋을 `data/SDNET2025/` 폴더에 배치합니다.
 python scripts/extract_features.py
 ```
 
-- ViT-L-14 모델 사용
-- 추출된 feature는 프로젝트 루트에 `.npy` 파일로 저장
+**설정**:
+- 모델: ViT-L-14 (OpenAI pretrained)
+- 출력: 프로젝트 루트에 `.npy` 파일로 저장
+  - `clip_features.npy`: Feature 벡터 (N×768)
+  - `clip_labels.npy`: 클래스 레이블 (0, 1, 2)
+  - `clip_class_names.npy`: 클래스 이름 배열
+  - `clip_image_paths.npy`: 이미지 파일 경로 배열
+
+**참고**: Feature 파일들은 `.gitignore`에 포함되어 Git에 추적되지 않습니다.
 
 #### Step 2: Zero-shot 베이스라인 평가
 
@@ -93,16 +115,23 @@ python scripts/extract_features.py
 python scripts/zero_shot_baseline.py
 ```
 
+**설정**:
+- 모델: ViT-B-32 (빠른 평가용)
+- Domain-aware 프롬프트 사용
 - 예상 성능: ~51.70%
 
-#### Step 3: Linear Probe 학습
+#### Step 3: MLP Probe 학습
 
 ```bash
 python scripts/train_linear_probe.py
 ```
 
-- MLP probe with mixup, class re-weighting
-- 최적 하이퍼파라미터 적용
+**설정**:
+- 아키텍처: 2-layer MLP (768 → 256 → 3)
+- 정규화: BatchNorm, Dropout(0.2), Gradient clipping
+- 데이터 증강: Mixup (α=0.3), Class re-weighting
+- 최적화: AdamW (LR=7e-4, WD=1e-4)
+- 학습: 500 epochs, Batch size=32, Early stopping
 - 예상 성능: ~69.68%
 
 #### Step 4: 논문 자료 생성
@@ -111,7 +140,9 @@ python scripts/train_linear_probe.py
 python scripts/generate_publication_assets.py
 ```
 
-- `paper/figures/` 및 `paper/tables/` 폴더에 자료 생성
+**생성되는 파일**:
+- `paper/figures/`: 논문용 고해상도 그림 (300 DPI)
+- `paper/tables/`: LaTeX 형식 표 파일
 
 ## 📈 성능 향상 과정
 
@@ -128,6 +159,7 @@ python scripts/generate_publication_assets.py
 **총 향상**: +17.98 percentage points (34.8% relative improvement)
 
 ### 핵심 발견사항
+
 1. **Prompt Engineering의 중요성**: Domain-specific 프롬프트가 +4.25% 향상
 2. **아키텍처 깊이의 효과**: MLP probe가 Linear보다 +11.6% 향상
 3. **하이퍼파라미터 민감도**: 최적 조합으로 +2.13% 추가 향상
@@ -143,19 +175,20 @@ python scripts/generate_publication_assets.py
 python scripts/generate_publication_assets.py
 ```
 
-이 스크립트는 다음을 생성합니다:
-- **그림** (`paper/figures/`):
-  - `performance_progression.png`: 단계별 성능 향상 그래프
-  - `grid_search_heatmap.png`: 하이퍼파라미터 그리드 서치 히트맵
-  - `confusion_matrix.png`: 혼동 행렬 (원본 및 정규화 버전)
-  - `tsne_projection.png`: CLIP feature 공간의 t-SNE 시각화
+**생성되는 자료**:
 
-- **표** (`paper/tables/`):
-  - `dataset_overview.tex`: 데이터셋 클래스 분포
-  - `performance_progression.tex`: 단계별 성능 향상
-  - `grid_search_top.tex`: 그리드 서치 상위 5개 결과
-  - `class_performance.tex`: 클래스별 상세 성능 지표 (Precision, Recall, F1)
-  - `confusion_report.txt`: 분류 리포트 (텍스트 형식)
+#### 그림 (`paper/figures/`)
+- `performance_progression.png`: 단계별 성능 향상 그래프
+- `grid_search_heatmap.png`: 하이퍼파라미터 그리드 서치 히트맵
+- `confusion_matrix.png`: 혼동 행렬 (원본 카운트 + 정규화 퍼센트)
+- `tsne_projection.png`: CLIP feature 공간의 t-SNE 시각화
+
+#### 표 (`paper/tables/`)
+- `dataset_overview.tex`: 데이터셋 클래스 분포
+- `performance_progression.tex`: 단계별 성능 향상
+- `grid_search_top.tex`: 그리드 서치 상위 5개 결과
+- `class_performance.tex`: 클래스별 상세 성능 지표 (Precision, Recall, F1)
+- `confusion_report.txt`: 분류 리포트 (텍스트 형식)
 
 **참고**: 생성된 LaTeX 표 파일들은 Word 문서에 직접 복사-붙여넣기하거나, 필요시 수정하여 사용할 수 있습니다.
 
@@ -169,57 +202,106 @@ python scripts/generate_publication_assets.py
 ### 핵심 기법 상세
 
 #### 1. Domain-aware Prompt Engineering
-```
-- Loosened: "a close-up photo of a loosened steel bolt that is not properly tightened..."
-- Missing: "a close-up photo showing an empty bolt hole where a steel bolt is completely missing..."
-- Fixed: "a close-up photo of a properly installed and tightly secured steel bolt..."
-```
+
+각 클래스에 대한 도메인 특화 프롬프트:
+
+- **Loosened**: "a close-up photo of a loosened steel bolt that is not properly tightened and needs repair on an industrial structure"
+- **Missing**: "a close-up photo showing an empty bolt hole where a steel bolt or nut is completely missing from a metal structure"
+- **Fixed**: "a close-up photo of a properly installed and tightly secured steel bolt with no defects or damage on a structure"
 
 #### 2. MLP Probe Architecture
-- **구조**: Linear(768→256) → BatchNorm → ReLU → Dropout(0.2) → Linear(256→3)
-- **정규화**: BatchNorm, Dropout, Gradient clipping (max_norm=1.0)
+
+```
+Input (768-dim) 
+  → Linear(768→256) 
+  → BatchNorm1d 
+  → ReLU 
+  → Dropout(0.2) 
+  → Linear(256→3) 
+  → Output (3 classes)
+```
+
+**정규화 기법**:
+- BatchNorm: 학습 안정화
+- Dropout: 과적합 방지 (rate=0.2)
+- Gradient clipping: 최대 norm=1.0
 
 #### 3. Regularization Techniques
+
 - **Mixup**: α=0.3, 학습 초기 70% epoch에 적용
 - **Class Re-weighting**: Inverse frequency weighting + Missing 클래스 1.5× boost
 - **Label Smoothing**: 0.1 smoothing factor
 
 #### 4. 최적화 설정
-- **Optimizer**: AdamW (LR=7e-4, Weight Decay=1e-4)
-- **Scheduler**: ReduceLROnPlateau (patience=25, factor=0.5)
-- **Training**: 500 epochs, Batch size=32, Early stopping (patience=75)
+
+- **Optimizer**: AdamW
+  - Learning Rate: 7e-4
+  - Weight Decay: 1e-4
+- **Scheduler**: ReduceLROnPlateau
+  - Patience: 25 epochs
+  - Factor: 0.5
+- **Training**:
+  - Epochs: 500 (최대)
+  - Batch size: 32
+  - Early stopping: Patience=75 epochs
 - **Data Split**: 150 samples/class for training, 나머지 test set
-
-## 📚 참고 자료
-
-- [CLIP Paper](https://arxiv.org/abs/2103.00020)
-- [OpenCLIP](https://github.com/mlfoundations/open_clip)
-- [SDNET2025 Dataset](https://github.com/sdnet2025/sdnet2025)
-
-## 🤝 기여
-
-이 프로젝트는 연구 목적으로 개발되었습니다.
-
-## 📝 라이선스
-
-연구 및 교육 목적으로 사용 가능합니다.
+- **Random Seed**: 42 (재현성 보장)
 
 ## 📋 파일 설명
 
 ### 스크립트 파일
-- `extract_features.py`: CLIP 모델을 사용하여 이미지에서 feature 벡터 추출
-- `zero_shot_baseline.py`: Zero-shot CLIP 분류 성능 평가
-- `train_linear_probe.py`: MLP probe를 사용한 분류기 학습 및 평가
-- `generate_publication_assets.py`: 논문용 그림과 표 자동 생성
+
+#### `extract_features.py`
+CLIP 모델을 사용하여 이미지에서 feature 벡터를 추출합니다.
+- 입력: `data/SDNET2025/` 폴더의 이미지
+- 출력: 프로젝트 루트에 `.npy` 파일 저장
+- 모델: ViT-L-14 (OpenAI pretrained)
+
+#### `zero_shot_baseline.py`
+Zero-shot CLIP 분류 성능을 평가합니다.
+- 모델: ViT-B-32 (빠른 평가용)
+- Domain-aware 프롬프트 사용
+- 각 이미지에 대한 예측 결과 출력
+
+#### `train_linear_probe.py`
+MLP probe를 사용한 분류기를 학습하고 평가합니다.
+- 최적화된 하이퍼파라미터 적용
+- 학습 과정 및 최종 성능 출력
+- 클래스별 상세 성능 지표 제공
+
+#### `generate_publication_assets.py`
+논문용 그림과 표를 자동으로 생성합니다.
+- 데이터셋 통계 분석
+- 성능 진행 그래프 생성
+- 그리드 서치 결과 시각화
+- t-SNE feature 시각화
+- 혼동 행렬 및 성능 리포트 생성
 
 ### 생성되는 파일
+
+다음 파일들은 스크립트 실행 시 생성되며, `.gitignore`에 포함되어 Git에 추적되지 않습니다:
+
 - `clip_features.npy`: 추출된 CLIP feature 벡터 (N×768)
 - `clip_labels.npy`: 클래스 레이블 (0, 1, 2)
 - `clip_class_names.npy`: 클래스 이름 배열
 - `clip_image_paths.npy`: 이미지 파일 경로 배열
 
-**주의**: `.npy` 파일들은 `.gitignore`에 포함되어 있어 Git에 추적되지 않습니다. 필요시 `extract_features.py`를 실행하여 재생성할 수 있습니다.
+**재생성**: 필요시 `extract_features.py`를 실행하여 재생성할 수 있습니다.
+
+## 📚 참고 자료
+
+- [CLIP Paper](https://arxiv.org/abs/2103.00020) - Radford et al., 2021
+- [OpenCLIP](https://github.com/mlfoundations/open_clip) - Open-source CLIP implementation
+- [SDNET2025 Dataset](https://github.com/sdnet2025/sdnet2025) - Structural defect dataset
+
+## 🤝 기여
+
+이 프로젝트는 연구 목적으로 개발되었습니다. 질문이나 제안사항이 있으시면 이슈를 등록해주세요.
+
+## 📝 라이선스
+
+연구 및 교육 목적으로 사용 가능합니다.
 
 ---
 
-**최종 업데이트**: 2025-01-XX
+**최종 업데이트**: 2025-01
