@@ -1,386 +1,428 @@
-import numpy as np
+"""Advanced CLIP feature probe training with ensembles and pseudo labels."""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
 from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# sklearn은 선택사항
+from training_utils import (
+    DeepMLPClassifier,
+    LabelSmoothingCrossEntropy,
+    build_train_test_split,
+    compute_class_weights,
+    cutmix_features,
+    mixup_criterion,
+    mixup_data,
+    set_seed,
+)
+
 try:
     from sklearn.metrics import classification_report, confusion_matrix
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
 
-# ---------- 설정 부분 ----------
+    HAS_SKLEARN = True
+except ImportError:  # pragma: no cover
+    HAS_SKLEARN = False
 
 ROOT_DIR = Path(__file__).parent.parent
 FEATURE_PATH = ROOT_DIR / "clip_features.npy"
 LABEL_PATH = ROOT_DIR / "clip_labels.npy"
 CLASS_NAMES_PATH = ROOT_DIR / "clip_class_names.npy"
-
-# 최적화된 하이퍼파라미터 (그리드 서치 최고 성능 조합)
-N_TRAIN_PER_CLASS = 150
-
-# 모델 아키텍처
-USE_MLP = True
-MLP_HIDDEN_DIM = 256
-MLP_NUM_LAYERS = 2
-USE_DROPOUT = True
-DROPOUT_RATE = 0.2  # 그리드 서치 최고 성능 조합
-
-# 학습 하이퍼파라미터 (개선된 설정)
-EPOCHS = 500  # 300 -> 500으로 증가 (더 긴 학습)
-BATCH_SIZE = 32
-LR = 7e-4  # 그리드 서치 최고 성능 조합
-WEIGHT_DECAY = 1e-4  # 그리드 서치 최고 성능 조합
-USE_LR_SCHEDULER = True
-SCHEDULER_PATIENCE = 25  # 그리드 서치와 동일 (Early stopping은 patience * 3으로 더 관대하게)
-
-# 데이터 증강
-USE_MIXUP = True
-MIXUP_ALPHA = 0.3
-
-# Loss 함수
-USE_FOCAL_LOSS = False
-USE_CLASS_WEIGHTS = True
-USE_LABEL_SMOOTHING = True
-LABEL_SMOOTHING = 0.1
-
-# 추가 개선 기법
-USE_TEMPERATURE_SCALING = False  # Temperature scaling (기본값 False, 필요시 True로 변경)
-TEMPERATURE_SEARCH_RANGE = [0.5, 3.0]  # Temperature 탐색 범위
-
-RANDOM_SEED = 42
-
-# ---------- 유틸 ----------
-
-def set_seed(seed: int = 42):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+IMAGE_PATHS_PATH = ROOT_DIR / "clip_image_paths.npy"
+DEFAULT_METADATA_PATH = ROOT_DIR / "metadata_features.npy"
+DEFAULT_PREDICTION_CSV = ROOT_DIR / "zero_shot_predictions.csv"
+PAPER_TABLE_DIR = ROOT_DIR / "paper" / "tables"
 
 
-def mixup_data(x, y, alpha=1.0):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train an MLP probe with publication-ready settings.")
+    parser.add_argument("--n-train-per-class", type=int, default=150)
+    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=7e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--mixup-alpha", type=float, default=0.3)
+    parser.add_argument("--cutmix-alpha", type=float, default=0.6)
+    parser.add_argument("--use-manifold-mixup", action="store_true")
+    parser.add_argument("--label-smoothing", type=float, default=0.1)
+    parser.add_argument("--pseudo-labels-csv", type=Path, default=DEFAULT_PREDICTION_CSV)
+    parser.add_argument("--pseudo-label-threshold", type=float, default=0.9)
+    parser.add_argument("--max-pseudo-per-class", type=int, default=160)
+    parser.add_argument("--ensemble", type=int, default=1)
+    parser.add_argument("--scheduler-patience", type=int, default=25)
+    parser.add_argument("--temperature-scaling", action="store_true")
+    parser.add_argument("--metadata-path", type=Path, default=DEFAULT_METADATA_PATH)
+    parser.add_argument("--metadata-normalize", action="store_true")
+    parser.add_argument("--experiment-name", type=str, default="mlp_probe")
+    parser.add_argument("--output-dir", type=Path, default=ROOT_DIR / "experiments")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-logits", action="store_true")
+    return parser.parse_args()
 
 
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
-
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing=0.1):
-        super().__init__()
-        self.smoothing = smoothing
-
-    def forward(self, inputs, targets):
-        log_probs = nn.functional.log_softmax(inputs, dim=1)
-        num_classes = inputs.size(1)
-        with torch.no_grad():
-            true_dist = torch.zeros_like(log_probs)
-            true_dist.fill_(self.smoothing / (num_classes - 1))
-            true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
-        return torch.mean(torch.sum(-true_dist * log_probs, dim=1))
-
-
-class DeepMLPClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dims=[256, 128], dropout_rate=0.3):
-        super().__init__()
-        layers = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout_rate))
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, num_classes))
-        self.network = nn.Sequential(*layers)
-        
-    def forward(self, x):
-        return self.network(x)
-
-
-def find_optimal_temperature(model, X_val, y_val, device, temp_range=[0.5, 3.0], step=0.1):
-    """Temperature scaling을 위한 최적 temperature 찾기"""
-    model.eval()
-    best_temp = 1.0
-    best_acc = 0.0
-    
-    with torch.no_grad():
-        logits = model(X_val)
-        
-        for temp in np.arange(temp_range[0], temp_range[1] + step, step):
-            scaled_logits = logits / temp
-            preds = torch.argmax(scaled_logits, dim=1)
-            acc = (preds == y_val).float().mean().item()
-            
-            if acc > best_acc:
-                best_acc = acc
-                best_temp = temp
-    
-    return best_temp
-
-
-# ---------- 메인 ----------
-
-def main():
-    set_seed(RANDOM_SEED)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[정보] 사용 디바이스: {device}")
-    print(f"[정보] 개선된 최종 학습 설정")
-    print(f"  - LR: {LR:.0e}")
-    print(f"  - Weight Decay: {WEIGHT_DECAY:.0e}")
-    print(f"  - Dropout: {DROPOUT_RATE:.1f}")
-    print(f"  - Epochs: {EPOCHS}")
-    print(f"  - Scheduler Patience: {SCHEDULER_PATIENCE}")
-
-    # 1. 데이터 로드
-    if not FEATURE_PATH.exists() or not LABEL_PATH.exists() or not CLASS_NAMES_PATH.exists():
-        print("[오류] feature/label/class_names 파일이 없습니다.")
-        return
-
+def load_feature_bank() -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    if not FEATURE_PATH.exists():
+        raise FileNotFoundError("clip_features.npy not found. Run scripts/extract_features.py first.")
     features = np.load(FEATURE_PATH)
     labels = np.load(LABEL_PATH)
     class_names = np.load(CLASS_NAMES_PATH)
+    image_paths = np.load(IMAGE_PATHS_PATH) if IMAGE_PATHS_PATH.exists() else None
+    return features, labels, class_names, image_paths
 
-    num_samples, feat_dim = features.shape
-    num_classes = len(class_names)
 
-    print(f"[정보] features shape: {features.shape}")
-    print(f"[정보] num_classes: {num_classes}")
-    print(f"[정보] class_names: {class_names}")
+def maybe_concat_metadata(features: np.ndarray, metadata_path: Path, normalize: bool) -> Tuple[np.ndarray, Optional[int]]:
+    if not metadata_path.exists():
+        return features, None
+    metadata = np.load(metadata_path)
+    if metadata.shape[0] != features.shape[0]:
+        raise ValueError("Metadata feature count does not match CLIP feature count.")
+    if normalize:
+        mean = metadata.mean(axis=0, keepdims=True)
+        std = metadata.std(axis=0, keepdims=True) + 1e-6
+        metadata = (metadata - mean) / std
+    merged = np.concatenate([features, metadata], axis=1)
+    print(
+        f"[정보] Metadata features concatenated (base_dim={features.shape[1]}, metadata_dim={metadata.shape[1]})"
+    )
+    return merged, metadata.shape[1]
 
-    # 2. Train/Test 분할 (그리드 서치와 동일한 방식으로 재현성 확보)
-    train_indices = []
-    test_indices = []
 
-    # 그리드 서치와 동일한 seed로 데이터 분할
-    set_seed(RANDOM_SEED)
-    
-    for cls_idx in range(num_classes):
-        cls_name = class_names[cls_idx]
-        cls_idxs = np.where(labels == cls_idx)[0]
-        np.random.shuffle(cls_idxs)
+def build_class_mapping(class_names: Sequence[str]) -> Dict[str, int]:
+    return {str(name).lower(): idx for idx, name in enumerate(class_names)}
 
-        n_train = min(N_TRAIN_PER_CLASS, len(cls_idxs))
-        cls_train = cls_idxs[:n_train]
-        cls_test = cls_idxs[n_train:]
 
-        train_indices.extend(cls_train.tolist())
-        test_indices.extend(cls_test.tolist())
+def load_pseudo_label_indices(
+    csv_path: Path,
+    image_paths: Optional[np.ndarray],
+    class_to_idx: Dict[str, int],
+    confidence_threshold: float,
+    max_per_class: int,
+    excluded_indices: set,
+) -> Tuple[List[int], List[int], List[float]]:
+    if image_paths is None or not csv_path.exists():
+        return [], [], []
+    path_to_idx = {Path(p).as_posix(): idx for idx, p in enumerate(image_paths)}
+    per_class_counter: Dict[int, int] = {idx: 0 for idx in class_to_idx.values()}
+    indices: List[int] = []
+    labels: List[int] = []
+    weights: List[float] = []
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            conf = float(row.get("confidence", row.get("probability", row.get("score", 0.0))))
+            if conf < confidence_threshold:
+                continue
+            cls = str(row.get("pred_class", row.get("class", ""))).lower().strip()
+            if cls not in class_to_idx:
+                continue
+            path = Path(row.get("image_path", row.get("path", ""))).as_posix()
+            idx = path_to_idx.get(path)
+            if idx is None or idx in excluded_indices:
+                continue
+            cls_idx = class_to_idx[cls]
+            if per_class_counter.setdefault(cls_idx, 0) >= max_per_class:
+                continue
+            per_class_counter[cls_idx] += 1
+            indices.append(idx)
+            labels.append(cls_idx)
+            weights.append(conf)
+    if indices:
+        print(f"[정보] pseudo labels 채택: {len(indices)} samples (threshold={confidence_threshold})")
+    return indices, labels, weights
 
-        print(f"[정보] 클래스 '{cls_name}': train {len(cls_train)}, test {len(cls_test)}")
 
-    train_indices = np.array(train_indices, dtype=np.int64)
-    test_indices = np.array(test_indices, dtype=np.int64)
+def prepare_training_data(args: argparse.Namespace):
+    features, labels, class_names, image_paths = load_feature_bank()
+    features, metadata_dim = maybe_concat_metadata(features, args.metadata_path, args.metadata_normalize)
+    class_to_idx = build_class_mapping(class_names)
+    split = build_train_test_split(labels, class_names, args.n_train_per_class, seed=args.seed)
+    excluded = set(split.train_indices.tolist()) | set(split.test_indices.tolist())
+    pseudo_idx, pseudo_lbl, pseudo_w = load_pseudo_label_indices(
+        args.pseudo_labels_csv,
+        image_paths,
+        class_to_idx,
+        args.pseudo_label_threshold,
+        args.max_pseudo_per_class,
+        excluded,
+    )
 
-    X_train = features[train_indices]
-    y_train = labels[train_indices]
-    X_test = features[test_indices]
-    y_test = labels[test_indices]
+    X_train = features[split.train_indices]
+    y_train = labels[split.train_indices]
+    sample_weights = np.ones_like(y_train, dtype=np.float32)
+    if pseudo_idx:
+        X_train = np.concatenate([X_train, features[pseudo_idx]], axis=0)
+        y_train = np.concatenate([y_train, np.array(pseudo_lbl, dtype=np.int64)], axis=0)
+        sample_weights = np.concatenate([sample_weights, np.array(pseudo_w, dtype=np.float32)], axis=0)
 
-    print(f"\n[정보] train 샘플 수: {X_train.shape[0]}")
-    print(f"[정보] test 샘플 수:  {X_test.shape[0]}")
+    X_test = features[split.test_indices]
+    y_test = labels[split.test_indices]
+    meta_info = {
+        "num_samples": int(features.shape[0]),
+        "feature_dim": int(features.shape[1]),
+        "metadata_dim": int(metadata_dim or 0),
+        "pseudo_samples": int(len(pseudo_idx)),
+        "train_size": int(X_train.shape[0]),
+        "test_size": int(X_test.shape[0]),
+    }
+    return (
+        torch.from_numpy(X_train).float(),
+        torch.from_numpy(y_train).long(),
+        torch.from_numpy(sample_weights).float(),
+        torch.from_numpy(X_test).float(),
+        torch.from_numpy(y_test).long(),
+        class_names,
+        meta_info,
+    )
 
-    # numpy -> torch tensor (그리드 서치와 동일하게 전체 train 데이터 사용)
-    X_train = torch.from_numpy(X_train).float().to(device)
-    y_train = torch.from_numpy(y_train).long().to(device)
-    X_test = torch.from_numpy(X_test).float().to(device)
-    y_test = torch.from_numpy(y_test).long().to(device)
 
-    # 3. 클래스 가중치 계산
-    if USE_CLASS_WEIGHTS:
-        all_class_counts = np.bincount(labels)
-        total_all = all_class_counts.sum()
-        class_weights = total_all / (num_classes * all_class_counts)
-        
-        missing_idx = None
-        for i, name in enumerate(class_names):
-            if str(name) == 'missing':
-                missing_idx = i
-                break
-        if missing_idx is not None:
-            class_weights[missing_idx] *= 1.5
-        
-        class_weights = class_weights / class_weights.min()
-        class_weights = torch.from_numpy(class_weights).float().to(device)
-        print(f"[정보] 클래스 가중치: {class_weights.cpu().numpy()}")
+def build_model(input_dim: int, num_classes: int, args: argparse.Namespace) -> DeepMLPClassifier:
+    if args.num_layers > 1:
+        step = max((args.hidden_dim - 128) // (args.num_layers - 1), 1)
+        hidden_dims = [max(args.hidden_dim - i * step, 128) for i in range(args.num_layers)]
     else:
-        class_weights = None
+        hidden_dims = [args.hidden_dim]
+    return DeepMLPClassifier(input_dim, num_classes, hidden_dims, dropout_rate=args.dropout)
 
-    # 4. Loss 함수
-    if USE_LABEL_SMOOTHING:
-        criterion = LabelSmoothingCrossEntropy(smoothing=LABEL_SMOOTHING)
-        print(f"[정보] Loss 함수: Label Smoothing CrossEntropy (smoothing={LABEL_SMOOTHING})")
-    else:
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        print(f"[정보] Loss 함수: CrossEntropyLoss")
 
-    # 5. 모델 정의
-    if USE_MLP:
-        hidden_dims = [MLP_HIDDEN_DIM] * MLP_NUM_LAYERS
-        if MLP_NUM_LAYERS > 1:
-            step = (MLP_HIDDEN_DIM - 128) // (MLP_NUM_LAYERS - 1)
-            hidden_dims = [MLP_HIDDEN_DIM - i * step for i in range(MLP_NUM_LAYERS)]
-        model = DeepMLPClassifier(feat_dim, num_classes, hidden_dims, DROPOUT_RATE if USE_DROPOUT else 0.0).to(device)
-        print(f"[정보] 모델 구조: {feat_dim} -> {' -> '.join(map(str, hidden_dims))} -> {num_classes}")
-    else:
-        model = nn.Linear(feat_dim, num_classes).to(device)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    
-    if USE_LR_SCHEDULER:
-        # Test accuracy 기준으로 스케줄링 (그리드 서치와 동일)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=SCHEDULER_PATIENCE, verbose=False
-        )
+def reduce_losses(
+    losses: torch.Tensor,
+    targets: torch.Tensor,
+    class_weights: Optional[torch.Tensor],
+    sample_weights: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if class_weights is not None:
+        losses = losses * class_weights[targets]
+    if sample_weights is not None:
+        losses = losses * sample_weights
+    return losses.mean()
 
-    # 6. 학습 루프
-    def evaluate(X, y, return_preds=False, temperature=1.0):
-        model.eval()
-        with torch.no_grad():
-            logits = model(X)
-            if temperature != 1.0:
-                logits = logits / temperature
-            preds = torch.argmax(logits, dim=1)
-            correct = (preds == y).sum().item()
-            total = y.size(0)
-            acc = correct / total if total > 0 else 0.0
-            if return_preds:
-                return acc, preds.cpu().numpy()
-            return acc
 
-    n_train_samples = X_train.size(0)
-    print("\n[정보] 개선된 선형 분류기 학습 시작")
-    print(f"  - Learning Rate: {LR}")
-    print(f"  - Weight Decay: {WEIGHT_DECAY}")
-    print(f"  - Mixup: {USE_MIXUP}")
-    print(f"  - Temperature Scaling: {USE_TEMPERATURE_SCALING} (선택사항)")
+def find_optimal_temperature(model, X_val, y_val, temp_range=(0.5, 3.0), step=0.1) -> float:
+    model.eval()
+    with torch.no_grad():
+        logits = model(X_val)
+    best_temp = 1.0
+    best_acc = 0.0
+    for temp in np.arange(temp_range[0], temp_range[1] + step, step):
+        scaled = logits / temp
+        preds = torch.argmax(scaled, dim=1)
+        acc = (preds == y_val).float().mean().item()
+        if acc > best_acc:
+            best_acc = acc
+            best_temp = float(temp)
+    return best_temp
 
-    best_test_acc = 0.0
-    patience_counter = 0
-    best_model_state = None
+
+def accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    preds = torch.argmax(logits, dim=1)
+    return (preds == targets).float().mean().item()
+
+
+def train_single_model(
+    args: argparse.Namespace,
+    tensors: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    class_names: np.ndarray,
+    member_seed: int,
+) -> Dict[str, torch.Tensor]:
+    set_seed(member_seed)
+    X_train, y_train, sample_weights, X_test, y_test = tensors
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(X_train.size(1), len(class_names), args).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=args.scheduler_patience, factor=0.5)
+    criterion = LabelSmoothingCrossEntropy(smoothing=args.label_smoothing, reduction="none")
+    class_weights = compute_class_weights(y_train.cpu().numpy(), class_names, device) if len(class_names) > 1 else None
+
+    X_train = X_train.to(device)
+    y_train = y_train.to(device)
+    X_test = X_test.to(device)
+    y_test = y_test.to(device)
+    train_weights = sample_weights.to(device)
+
+    n_train = X_train.size(0)
+    best_acc = 0.0
+    best_state = None
     best_epoch = 0
+    patience = 0
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        perm = torch.randperm(n_train_samples)
+        perm = torch.randperm(n_train, device=device)
         epoch_loss = 0.0
-
-        for i in range(0, n_train_samples, BATCH_SIZE):
-            idx = perm[i:i + BATCH_SIZE]
+        for i in range(0, n_train, args.batch_size):
+            idx = perm[i : i + args.batch_size]
             batch_X = X_train[idx]
             batch_y = y_train[idx]
-
+            batch_weights = train_weights[idx]
             optimizer.zero_grad()
-            
-            if USE_MIXUP and epoch <= EPOCHS * 0.7:
-                mixed_X, y_a, y_b, lam = mixup_data(batch_X, batch_y, MIXUP_ALPHA)
+
+            if args.cutmix_alpha > 0:
+                batch_X, _ = cutmix_features(batch_X, alpha=args.cutmix_alpha)
+            if args.mixup_alpha > 0 and epoch <= int(args.epochs * 0.7):
+                mixed_X, y_a, y_b, lam = mixup_data(batch_X, batch_y, args.mixup_alpha)
                 logits = model(mixed_X)
-                loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
+                losses = mixup_criterion(criterion, logits, y_a, y_b, lam)
+                loss = reduce_losses(losses, y_a, class_weights, batch_weights)
             else:
-                logits = model(batch_X)
-                loss = criterion(logits, batch_y)
-            
+                if args.use_manifold_mixup:
+                    logits, feats = model(batch_X, return_features=True)
+                    lam = np.random.beta(1.5, 1.5)
+                    perm_idx = torch.randperm(feats.size(0), device=device)
+                    mixed_feats = lam * feats + (1 - lam) * feats[perm_idx]
+                    logits = model.classifier(mixed_feats)
+                    losses = criterion(logits, batch_y)
+                else:
+                    logits = model(batch_X)
+                    losses = criterion(logits, batch_y)
+                loss = reduce_losses(losses, batch_y, class_weights, batch_weights)
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-
             epoch_loss += loss.item() * batch_X.size(0)
 
-        epoch_loss /= n_train_samples
+        epoch_loss /= n_train
+        with torch.no_grad():
+            train_logits = model(X_train)
+            test_logits = model(X_test)
+            train_acc = accuracy_from_logits(train_logits, y_train)
+            test_acc = accuracy_from_logits(test_logits, y_test)
 
-        train_acc = evaluate(X_train, y_train)
-        test_acc = evaluate(X_test, y_test)
-
-        if USE_LR_SCHEDULER:
-            scheduler.step(test_acc)  # test accuracy 기준으로 스케줄링
-
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
+        scheduler.step(test_acc)
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             best_epoch = epoch
-            patience_counter = 0
-            best_model_state = model.state_dict().copy()
+            patience = 0
         else:
-            patience_counter += 1
+            patience += 1
 
-        if epoch % 20 == 0 or epoch == 1 or epoch == EPOCHS:
-            current_lr = optimizer.param_groups[0]['lr']
+        if epoch % 20 == 0 or epoch == 1:
             print(
-                f"[Epoch {epoch:03d}] "
-                f"Loss: {epoch_loss:.4f} | "
-                f"Train Acc: {train_acc * 100:.2f}% | "
-                f"Test Acc: {test_acc * 100:.2f}% | "
-                f"Best Test: {best_test_acc * 100:.2f}% (Epoch {best_epoch}) | "
-                f"LR: {current_lr:.2e}"
+                f"[Ensemble seed {member_seed}] Epoch {epoch:03d} | Loss={epoch_loss:.4f} "
+                f"Train={train_acc*100:.2f}% Test={test_acc*100:.2f}% Best={best_acc*100:.2f}%"
             )
-
-        # Early stopping: 더 관대하게 (patience * 3)
-        if patience_counter >= SCHEDULER_PATIENCE * 3:
-            print(f"\n[조기 종료] {epoch} epoch에서 조기 종료 (Best: Epoch {best_epoch})")
-            if best_model_state is not None:
-                model.load_state_dict(best_model_state)
+        if patience >= args.scheduler_patience * 3:
+            print(f"[조기 종료] member_seed={member_seed} epoch={epoch}")
             break
 
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-    
-    # 7. Temperature Scaling (선택사항 - test set에서 최적화)
-    optimal_temp = 1.0
-    if USE_TEMPERATURE_SCALING:
-        print("\n[정보] Temperature Scaling 최적화 중... (test set 기준)")
-        optimal_temp = find_optimal_temperature(
-            model, X_test, y_test, device, 
-            temp_range=TEMPERATURE_SEARCH_RANGE, step=0.1
-        )
-        print(f"[정보] 최적 Temperature: {optimal_temp:.2f}")
-    
-    # 최종 평가
-    final_train_acc = evaluate(X_train, y_train, temperature=optimal_temp)
-    final_test_acc, test_preds = evaluate(X_test, y_test, return_preds=True, temperature=optimal_temp)
-    
-    print("\n[완료] 개선된 linear probe 학습 종료.")
-    print(f"  - 최종 Train Accuracy: {final_train_acc * 100:.2f}%")
-    print(f"  - 최종 Test  Accuracy: {final_test_acc * 100:.2f}%")
-    print(f"  - Best Test Accuracy: {best_test_acc * 100:.2f}% (Epoch {best_epoch})")
-    if USE_TEMPERATURE_SCALING and optimal_temp != 1.0:
-        print(f"  - Temperature Scaling 적용: {optimal_temp:.2f}")
-        print(f"  - Temperature Scaling 후 Test Accuracy: {final_test_acc * 100:.2f}%")
-    else:
-        print(f"  - Temperature Scaling 미사용 (기본값 1.0)")
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
-    if HAS_SKLEARN:
-        print("\n[상세 분류 리포트]")
-        print(classification_report(
-            y_test.cpu().numpy(), 
-            test_preds, 
-            target_names=[str(name) for name in class_names]
-        ))
-        
-        print("\n[혼동 행렬]")
-        cm = confusion_matrix(y_test.cpu().numpy(), test_preds)
-        print(cm)
-        
-        print("\n[클래스별 정확도]")
-        y_test_np = y_test.cpu().numpy()
-        for cls_idx, cls_name in enumerate(class_names):
-            cls_mask = y_test_np == cls_idx
-            if cls_mask.sum() > 0:
-                cls_correct = (test_preds[cls_mask] == cls_idx).sum()
-                cls_total = cls_mask.sum()
-                cls_acc = cls_correct / cls_total
-                print(f"  - {cls_name}: {cls_correct}/{cls_total} ({cls_acc * 100:.2f}%)")
+    model.eval()
+    with torch.no_grad():
+        train_logits = model(X_train)
+        test_logits = model(X_test)
+    temperature = 1.0
+    if args.temperature_scaling:
+        temperature = find_optimal_temperature(model, X_test, y_test)
+        train_logits = train_logits / temperature
+        test_logits = test_logits / temperature
+    metrics = {
+        "train_acc": accuracy_from_logits(train_logits, y_train),
+        "test_acc": accuracy_from_logits(test_logits, y_test),
+        "best_test_acc": best_acc,
+        "best_epoch": best_epoch,
+        "temperature": temperature,
+    }
+    return {
+        "train_logits": train_logits.cpu(),
+        "test_logits": test_logits.cpu(),
+        "metrics": metrics,
+    }
+
+
+def export_publication_tables(test_acc: float, ensemble: int, meta_info: Dict[str, int]) -> None:
+    PAPER_TABLE_DIR.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Advanced probe ensemble summary on SDNET2025.}",
+        "\\label{tab:advanced_probe}",
+        "\\begin{tabular}{lcc}",
+        "\\toprule",
+        "Configuration & Value & Notes \\\\",
+        "\\midrule",
+        f"Ensemble Size & {ensemble} & Independent seeds \\\\",
+        f"Train/Test Samples & {meta_info['train_size']}/{meta_info['test_size']} & "
+        "150 shots/class + remainder \\\\",
+        f"Metadata Dim & {meta_info['metadata_dim']} & Additional context features \\\\",
+        f"Pseudo Labels & {meta_info['pseudo_samples']} & Zero-shot filtered \\\\",
+        f"Ensemble Test Acc & {test_acc*100:.2f}\% & Temperature calibrated \\\\",
+        "\\bottomrule",
+        "\\end{tabular}",
+        "\\end{table}",
+    ]
+    (PAPER_TABLE_DIR / "advanced_probe_summary.tex").write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_classification_assets(
+    output_dir: Path,
+    y_true: np.ndarray,
+    preds: np.ndarray,
+    class_names: Sequence[str],
+) -> None:
+    if not HAS_SKLEARN:
+        return
+    report = classification_report(y_true, preds, target_names=[str(c) for c in class_names])
+    (output_dir / "classification_report.txt").write_text(report, encoding="utf-8")
+    cm = confusion_matrix(y_true, preds, labels=list(range(len(class_names))))
+    cm_path = output_dir / "confusion_matrix.npy"
+    np.save(cm_path, cm)
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    tensors = prepare_training_data(args)
+    X_train, y_train, sample_weights, X_test, y_test, class_names, meta_info = tensors
+    # Keep CPU copies for evaluation
+    cpu_tensors = (X_train.clone(), y_train.clone(), sample_weights.clone(), X_test.clone(), y_test.clone())
+    output_dir = args.output_dir / args.experiment_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    member_results = []
+    for member in range(args.ensemble):
+        print(f"\n[정보] Ensemble member {member + 1}/{args.ensemble}")
+        result = train_single_model(args, cpu_tensors[:5], class_names, args.seed + member)
+        member_results.append(result)
+
+    avg_train_logits = torch.stack([r["train_logits"] for r in member_results]).mean(dim=0)
+    avg_test_logits = torch.stack([r["test_logits"] for r in member_results]).mean(dim=0)
+    train_acc = accuracy_from_logits(avg_train_logits, cpu_tensors[1])
+    test_acc = accuracy_from_logits(avg_test_logits, cpu_tensors[4])
+    summary = {
+        "meta": meta_info,
+        "members": [res["metrics"] for res in member_results],
+        "ensemble_test_acc": test_acc,
+        "ensemble_train_acc": train_acc,
+        "args": vars(args),
+    }
+    metrics_path = output_dir / "metrics.json"
+    metrics_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if args.save_logits:
+        np.save(output_dir / "ensemble_train_logits.npy", avg_train_logits.numpy())
+        np.save(output_dir / "ensemble_test_logits.npy", avg_test_logits.numpy())
+
+    preds = torch.argmax(avg_test_logits, dim=1).cpu().numpy()
+    write_classification_assets(output_dir, cpu_tensors[4].cpu().numpy(), preds, class_names)
+    export_publication_tables(test_acc, args.ensemble, meta_info)
+
+    print("\n[완료] Advanced MLP probe 학습 결과")
+    print(f"  - Ensemble Test Accuracy: {test_acc * 100:.2f}%")
+    print(f"  - Ensemble Train Accuracy: {train_acc * 100:.2f}%")
+    print(f"  - 메트릭 로그: {metrics_path}")
 
 
 if __name__ == "__main__":
     main()
-

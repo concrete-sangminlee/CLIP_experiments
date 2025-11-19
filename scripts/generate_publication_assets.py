@@ -525,6 +525,7 @@ def maybe_generate_csv_tables():
     csv_configs = [
         (ROOT / "ensemble_results.csv", TABLE_DIR / "ensemble_results.tex", "Ensemble experiments summary.", "tab:ensemble"),
         (ROOT / "lora_results.csv", TABLE_DIR / "lora_results.tex", "LoRA fine-tuning experiments.", "tab:lora"),
+        (ROOT / "experiments" / "self_training_history.csv", TABLE_DIR / "self_training.tex", "Self-training progression.", "tab:self_training"),
     ]
     for csv_path, out_path, caption, label in csv_configs:
         if csv_path.exists():

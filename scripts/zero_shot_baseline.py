@@ -1,171 +1,140 @@
-import os
-from pathlib import Path
+"""Zero-shot CLIP evaluation with prompt ensembles and CSV export."""
+from __future__ import annotations
 
-import torch
+import argparse
+import csv
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import numpy as np
+import torch
 from PIL import Image
 
 import open_clip
 
+from prompt_library import DEFAULT_TEMPLATE_KEYS, build_prompts
 
-# ---------- 설정 부분 ----------
+ROOT = Path(__file__).parent.parent
+DATA_ROOT = ROOT / "data" / "SDNET2025"
+DEFAULT_CSV = ROOT / "zero_shot_predictions.csv"
 
-# SDNET2025 데이터가 있는 루트 디렉토리
-DATA_ROOT = Path(__file__).parent.parent / "data" / "SDNET2025"
-
-# 클래스별 폴더 이름과 텍스트 프롬프트 매핑 (개선된 버전)
-CLASS_PROMPTS = {
-    "loosened": "a close-up photo of a loosened steel bolt that is not properly tightened and needs repair on an industrial structure",
-    "missing": "a close-up photo showing an empty bolt hole where a steel bolt or nut is completely missing from a metal structure",
-    "fixed": "a close-up photo of a properly installed and tightly secured steel bolt with no defects or damage on a structure",
-}
-
-# 실제로 사용할 클래스 폴더들 (DATA_ROOT 아래 폴더 이름과 동일하게)
-# 실제 데이터 구조가 다르면 여기를 수정하세요.
-# 예: ["Annotated Loosen bolt & nuts/Resized images 640-640", "Annotated Missing bolt & nuts/Resized- 640-640", "Fixed/640-640"]
 CLASS_DIRS = [
     "Dataset/Defected/Annotated Loosen bolt & nuts/Resized images 640-640",
     "Dataset/Defected/Annotated Missing bolt & nuts/Resized- 640-640",
-    "Dataset/Fixed/640-640"
+    "Dataset/Fixed/640-640",
 ]
-
-# CLASS_DIRS와 CLASS_PROMPTS의 키를 매핑 (폴더 경로 -> 클래스 이름)
-# CLASS_DIRS의 순서와 CLASS_PROMPTS.keys()의 순서가 일치해야 함
 CLASS_DIR_TO_NAME = {
     "Dataset/Defected/Annotated Loosen bolt & nuts/Resized images 640-640": "loosened",
     "Dataset/Defected/Annotated Missing bolt & nuts/Resized- 640-640": "missing",
-    "Dataset/Fixed/640-640": "fixed"
+    "Dataset/Fixed/640-640": "fixed",
 }
 
-# 사용할 CLIP 모델 이름
-CLIP_MODEL_NAME = "ViT-B-32"
-CLIP_PRETRAINED = "openai"
 
-# 테스트할 최대 이미지 수 (너무 많으면 시간 오래 걸리니까 제한)
-MAX_IMAGES_PER_CLASS = 50  # 원하면 10 정도로 줄여도 됨
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run CLIP zero-shot baseline with richer prompts.")
+    parser.add_argument("--model", type=str, default="ViT-B-32")
+    parser.add_argument("--pretrained", type=str, default="openai")
+    parser.add_argument("--max-images-per-class", type=int, default=80)
+    parser.add_argument("--templates", type=str, default=",".join(DEFAULT_TEMPLATE_KEYS))
+    parser.add_argument("--languages", type=str, default="en,ko")
+    parser.add_argument("--save-csv", type=Path, default=DEFAULT_CSV)
+    parser.add_argument("--temperature", type=float, default=100.0)
+    return parser.parse_args()
 
 
-# ---------- 유틸 함수 ----------
-
-def collect_image_paths(root: Path, class_dirs, class_dir_to_name, max_per_class=None):
-    image_paths = []
-    labels = []
-
+def collect_image_paths(max_per_class: int) -> Tuple[List[Path], List[str]]:
+    image_paths: List[Path] = []
+    labels: List[str] = []
     exts = {".jpg", ".jpeg", ".png", ".bmp"}
-
-    for cls_dir_path in class_dirs:
-        cls_dir = root / cls_dir_path
-        if not cls_dir.exists():
-            print(f"[경고] 폴더가 없습니다: {cls_dir} (건너뜀)")
-            continue
-
-        # 폴더 경로를 클래스 이름으로 변환
-        cls_name = class_dir_to_name.get(cls_dir_path, cls_dir_path)
-        
-        cls_images = []
-        for p in cls_dir.rglob("*"):
-            if p.suffix.lower() in exts:
-                cls_images.append(p)
-
-        if max_per_class is not None:
+    for cls_dir_path in CLASS_DIRS:
+        cls_dir = DATA_ROOT / cls_dir_path
+        cls_name = CLASS_DIR_TO_NAME.get(cls_dir_path, cls_dir_path)
+        cls_images = [p for p in cls_dir.rglob("*") if p.suffix.lower() in exts]
+        if max_per_class:
             cls_images = cls_images[:max_per_class]
-
-        print(f"[정보] 클래스 '{cls_name}' (폴더: {cls_dir_path})에서 {len(cls_images)}개 이미지 사용")
-
         image_paths.extend(cls_images)
         labels.extend([cls_name] * len(cls_images))
-
+        print(f"[정보] 클래스 '{cls_name}'에서 {len(cls_images)}개 샘플 사용")
     return image_paths, labels
 
 
-def load_image(path, preprocess):
-    img = Image.open(path).convert("RGB")
-    return preprocess(img)
+def encode_prompts(model, tokenizer, class_names: List[str], template_keys: List[str], languages: List[str], device) -> torch.Tensor:
+    per_class_embeddings = []
+    for cls in class_names:
+        prompts = build_prompts(cls, template_keys, languages)
+        if not prompts:
+            continue
+        with torch.no_grad():
+            tokens = tokenizer(prompts).to(device)
+            text_feats = model.encode_text(tokens)
+            text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
+        per_class_embeddings.append(text_feats.mean(dim=0, keepdim=True))
+    if not per_class_embeddings:
+        raise RuntimeError("No prompts were generated. Check template/language arguments.")
+    return torch.cat(per_class_embeddings, dim=0)
 
 
-# ---------- 메인 ----------
+def load_image(path: Path, preprocess) -> torch.Tensor:
+    return preprocess(Image.open(path).convert("RGB"))
+
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[정보] 사용 디바이스: {device}")
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[정보] 모델 {args.model} ({args.pretrained}) on {device}")
 
-    # 1. CLIP 모델 불러오기
-    print(f"[정보] CLIP 모델 로드: {CLIP_MODEL_NAME} ({CLIP_PRETRAINED})")
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        CLIP_MODEL_NAME, pretrained=CLIP_PRETRAINED
-    )
-    tokenizer = open_clip.get_tokenizer(CLIP_MODEL_NAME)
-
+    model, _, preprocess = open_clip.create_model_and_transforms(args.model, pretrained=args.pretrained)
+    tokenizer = open_clip.get_tokenizer(args.model)
     model = model.to(device)
     model.eval()
 
-    # 2. 텍스트 프롬프트 인코딩
-    class_names = list(CLASS_PROMPTS.keys())
-    prompts = [CLASS_PROMPTS[c] for c in class_names]
+    template_keys = [t.strip() for t in args.templates.split(",") if t.strip()]
+    languages = [l.strip() for l in args.languages.split(",") if l.strip()]
 
-    with torch.no_grad():
-        text_tokens = tokenizer(prompts).to(device)
-        text_features = model.encode_text(text_tokens)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    image_paths, str_labels = collect_image_paths(args.max_images_per_class)
+    class_names = sorted({CLASS_DIR_TO_NAME[c] for c in CLASS_DIRS})
+    text_features = encode_prompts(model, tokenizer, class_names, template_keys, languages, device)
 
-    print("[정보] 텍스트 프롬프트 인코딩 완료")
-    for name, prompt in zip(class_names, prompts):
-        print(f"  - {name}: \"{prompt}\"")
-
-    # 3. 이미지 경로 모으기
-    image_paths, labels = collect_image_paths(
-        DATA_ROOT, CLASS_DIRS, CLASS_DIR_TO_NAME, max_per_class=MAX_IMAGES_PER_CLASS
-    )
-
-    if len(image_paths) == 0:
-        print("[오류] 사용할 이미지가 없습니다. DATA_ROOT와 폴더 구조를 확인하세요.")
-        return
-
-    # 4. 이미지 인코딩 + zero-shot 분류
+    rows = []
     correct = 0
     total = 0
-
-    print("\n[정보] Zero-shot CLIP 예측 시작")
-
     with torch.no_grad():
-        for img_path, true_cls in zip(image_paths, labels):
-            # 이미지 로드 및 전처리
-            image_tensor = load_image(img_path, preprocess).unsqueeze(0).to(device)
-
-            # 이미지 feature 추출
-            image_features = model.encode_image(image_tensor)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-            # 텍스트 feature와 코사인 유사도 계산
-            # (batch=1 이므로 text_features (N_classes, D)와 matmul)
-            logits = 100.0 * image_features @ text_features.T  # temperature scaling
+        for path, label in zip(image_paths, str_labels):
+            img_tensor = load_image(path, preprocess).unsqueeze(0).to(device)
+            image_feat = model.encode_image(img_tensor)
+            image_feat = image_feat / image_feat.norm(dim=-1, keepdim=True)
+            logits = args.temperature * image_feat @ text_features.T
             probs = logits.softmax(dim=-1).cpu().numpy()[0]
-
             pred_idx = int(np.argmax(probs))
-            pred_cls = class_names[pred_idx]
-            pred_prob = probs[pred_idx]
-
+            pred_name = class_names[pred_idx]
             total += 1
-            if pred_cls == true_cls:
+            if pred_name == label:
                 correct += 1
-
-            # 파일 이름 + 예측 결과 출력
+            rows.append(
+                {
+                    "image_path": path.as_posix(),
+                    "gt_class": label,
+                    "pred_class": pred_name,
+                    "confidence": float(probs[pred_idx]),
+                }
+            )
             print(
-                f"[{total:03d}] {img_path.name} | "
-                f"GT: {true_cls:8s} | Pred: {pred_cls:8s} "
-                f"(p={pred_prob:.3f})"
+                f"[{total:03d}] {path.name} | GT={label:8s} | Pred={pred_name:8s} | p={probs[pred_idx]:.3f}"
             )
 
-    acc = correct / total if total > 0 else 0.0
-    print("\n[결과] Zero-shot CLIP 정확도")
-    print(f"  - 총 이미지 수: {total}")
-    print(f"  - 정답 수: {correct}")
+    acc = correct / total if total else 0.0
+    print("\n[결과] Zero-shot 정확도")
+    print(f"  - Samples: {total}")
     print(f"  - Accuracy: {acc * 100:.2f}%")
 
-    print("\n[참고] 정확도가 낮더라도 괜찮습니다.")
-    print(" - 여기서부터 few-shot linear probe나 LoRA fine-tuning으로 확장하면 됨.")
+    if rows:
+        args.save_csv.parent.mkdir(parents=True, exist_ok=True)
+        with args.save_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["image_path", "gt_class", "pred_class", "confidence"])
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"[저장] CSV 로그: {args.save_csv}")
 
 
 if __name__ == "__main__":
     main()
-
